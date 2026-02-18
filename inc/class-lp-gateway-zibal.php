@@ -18,59 +18,27 @@ if (!class_exists('LP_Gateway_Zibal')) {
      */
     class LP_Gateway_Zibal extends LP_Gateway_Abstract
     {
-        /**
-         * @var string
-         */
+       
         public $id = 'zibal';
 
-        /**
-         * @var array
-         */
         private $form_data = array();
 
-        /**
-         * @var string
-         */
         private $startPay = 'https://gateway.zibal.ir/start/';
 
-        /**
-         * @var string
-         */
         private $restPaymentRequestUrl = 'https://gateway.zibal.ir/v1/request';
 
-        /**
-         * @var string
-         */
         private $restPaymentVerification = 'https://gateway.zibal.ir/v1/verify';
 
-        /**
-         * @var string
-         */
         private $merchant = null;
 
-        /**
-         * @var array|null
-         */
         protected $settings = null;
 
-        /**
-         * @var null
-         */
         protected $order = null;
 
-        /**
-         * @var null
-         */
         protected $posted = null;
 
-        /**
-         * @var string
-         */
         protected $trackId = null;
 
-        /**
-         * LP_Gateway_Zibal constructor.
-         */
         public function __construct()
         {
             $this->method_title = __('Zibal', 'learnpress-zibal');
@@ -110,9 +78,6 @@ if (!class_exists('LP_Gateway_Zibal')) {
             $this->icon = LP_ZIBAL_URL . 'assets/images/zibal.png';
         }
 
-        /**
-         * Check if gateway is available
-         */
         public function is_available()
         {
             $is_enabled = LP()->settings->get("{$this->id}.enable") === 'yes';
@@ -121,9 +86,6 @@ if (!class_exists('LP_Gateway_Zibal')) {
             return $is_enabled && $has_merchant;
         }
 
-        /**
-         * Get gateway icon
-         */
         public function get_icon()
         {
             $icon_url = LP_ZIBAL_URL . 'assets/images/zibal.png';
@@ -136,35 +98,24 @@ if (!class_exists('LP_Gateway_Zibal')) {
             return '';
         }
 
-        /**
-         * Get gateway title
-         */
+ 
         public function get_title()
         {
             return $this->title;
         }
 
-        /**
-         * Get gateway description
-         */
         public function get_description()
         {
             return $this->description;
         }
 
-        /**
-         * Get supported currencies
-         */
+    
         public function get_supported_currencies()
         {
             return array('IRR', 'IRT');
         }
 
-        /**
-         * Admin payment settings.
-         *
-         * @return array
-         */
+   
         public function get_settings()
         {
             return apply_filters(
