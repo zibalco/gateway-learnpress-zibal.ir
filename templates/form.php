@@ -21,7 +21,7 @@ defined('ABSPATH') || exit();
 $settings = LP()->settings; ?>
 
 <p><?php
-    echo $this->get_description(); ?></p>
+    echo wp_kses_post($this->get_description()); ?></p>
 
 <div id="learn-press-zibal-form" class="<?php
 if (is_rtl()) {

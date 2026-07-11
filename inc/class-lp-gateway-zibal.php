@@ -39,6 +39,8 @@ if (!class_exists('LP_Gateway_Zibal')) {
 
         protected $trackId = null;
 
+        private $plugin_user_agent = 'LearnPress-Zibal-Gateway/2.1.1 (WordPress; plugin=gateway-learnpress-zibal.ir; gateway=zibal)';
+
         public function __construct()
         {
             $this->method_title = __('Zibal', 'learnpress-zibal');
@@ -308,7 +310,7 @@ if (!class_exists('LP_Gateway_Zibal')) {
         {
             $this->order = learn_press_get_order($order);
             $trackId = $this->get_zibal_authority();
-            $gateway_url = $this->startPay . $this->trackId;
+            $gateway_url = $this->startPay . rawurlencode($this->trackId);
 
             return array(
                 'result'   => $trackId ? 'success' : 'fail',
@@ -322,60 +324,255 @@ if (!class_exists('LP_Gateway_Zibal')) {
         public function get_zibal_authority()
         {
             if ($this->get_form_data()) {
+                $order_id = absint($this->order->get_id());
+                $amount = absint($this->form_data['amount']);
+                $callback_token = $this->generate_callback_token($order_id);
+
                 // Use site URL for callback to match domain
-                $callback_url = site_url('wp-content/plugins/' . basename(dirname(LP_ZIBAL_FILE)) . '/inc/callback.php?learn_press_zibal=1&order_id=' . $this->order->get_id());
+                $callback_url = add_query_arg(
+                    array(
+                        'learn_press_zibal' => 1,
+                        'order_id'          => $order_id,
+                        'zibal_token'       => $callback_token,
+                    ),
+                    site_url('wp-content/plugins/' . basename(dirname(LP_ZIBAL_FILE)) . '/inc/callback.php')
+                );
                 
                 $data = array(
-                    "merchant"    => $this->merchant,
-                    "amount"      => intval($this->form_data['amount']),
+                    "merchant"    => sanitize_text_field($this->merchant),
+                    "amount"      => $amount,
                     "callbackUrl" => $callback_url,
-                    "description" => $this->form_data['description'],
+                    "description" => sanitize_text_field($this->form_data['description']),
                 );
                 
                 // Add optional fields
                 if (!empty($this->posted['email'])) {
-                    $data['mobile'] = $this->posted['email'];
+                    $data['email'] = sanitize_email($this->posted['email']);
                 }
                 if (!empty($this->posted['mobile'])) {
-                    $data['mobile'] = $this->posted['mobile'];
+                    $data['mobile'] = sanitize_text_field($this->posted['mobile']);
                 }
 
-                $jsonData = json_encode($data);
-                $ch = curl_init('https://gateway.zibal.ir/v1/request');
-                curl_setopt($ch, CURLOPT_USERAGENT, 'Zibal Rest Api v1');
-                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
-                curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonData);
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                    'Content-Type: application/json',
-                    'Content-Length: ' . strlen($jsonData),
-                ));
+                try {
+                    $result = $this->send_zibal_request($this->restPaymentRequestUrl, $data);
+                } catch (Exception $exception) {
+                    $this->add_order_message($order_id, $exception->getMessage(), 'failed');
+                    throw $exception;
+                }
 
-                $result = curl_exec($ch);
-                $err = curl_error($ch);
-                $result = json_decode($result, true);
-                curl_close($ch);
+                if (isset($result['result'])) {
+                    if (intval($result['result']) === 100 && !empty($result['trackId'])) {
+                        $this->trackId = sanitize_text_field($result['trackId']);
+                        $this->store_pending_payment($order_id, $amount, $this->trackId, $callback_token);
+                        return true;
+                    }
 
-                if ($err) {
-                    throw new Exception('خطای ارتباط با درگاه: ' . $err, 8000);
-                } else {
-                    if (isset($result['result'])) {
-                        if ($result['result'] == 100) {
-                            $this->trackId = $result['trackId'];
-                            return true;
-                        } else {
-                            // Show Zibal error code
-                            $error_code = $result['result'];
-                            $error_message = $this->get_zibal_error_message($error_code);
-                            throw new Exception('خطا: ' . $error_message . ' (کد: ' . $error_code . ')', 8000);
-                        }
-                    } else {
-                        throw new Exception('خطا: پاسخ نامعتبر از درگاه', 8000);
+                    // Show Zibal error code
+                    $error_code = intval($result['result']);
+                    $error_message = $this->get_zibal_response_message($result, $error_code);
+                    $this->add_order_message($order_id, $error_message, 'failed');
+                    throw new Exception('خطا: ' . $error_message . ' (کد: ' . $error_code . ')', 8000);
+                }
+
+                $this->add_order_message($order_id, 'خطا: پاسخ نامعتبر از درگاه', 'failed');
+                throw new Exception('خطا: پاسخ نامعتبر از درگاه', 8000);
+            }
+
+            return false;
+        }
+
+        /**
+         * Send JSON request to Zibal with WordPress HTTP API.
+         */
+        protected function send_zibal_request($url, $data)
+        {
+            $response = wp_remote_post(
+                esc_url_raw($url),
+                array(
+                    'timeout' => 20,
+                    'headers' => array(
+                        'Content-Type' => 'application/json',
+                        'User-Agent'   => $this->plugin_user_agent,
+                    ),
+                    'user-agent' => $this->plugin_user_agent,
+                    'body'    => wp_json_encode($data),
+                )
+            );
+
+            if (is_wp_error($response)) {
+                throw new Exception('خطای ارتباط با درگاه: ' . $response->get_error_message(), 8000);
+            }
+
+            $status_code = intval(wp_remote_retrieve_response_code($response));
+            $body = wp_remote_retrieve_body($response);
+
+            if ($status_code < 200 || $status_code >= 300 || empty($body)) {
+                $decoded_error = json_decode($body, true);
+                $message = is_array($decoded_error) ? $this->get_zibal_response_message($decoded_error, 0) : '';
+
+                if (empty($message)) {
+                    $message = 'خطای ارتباط با درگاه';
+                }
+
+                throw new Exception($message, 8000);
+            }
+
+            $decoded = json_decode($body, true);
+
+            if (!is_array($decoded)) {
+                throw new Exception('خطا: پاسخ نامعتبر از درگاه', 8000);
+            }
+
+            return $decoded;
+        }
+
+        /**
+         * Prefer the exact provider message when Zibal sends one.
+         */
+        private function get_zibal_response_message($result, $code)
+        {
+            foreach (array('message', 'errorMessage', 'description') as $key) {
+                if (!empty($result[$key])) {
+                    return sanitize_text_field($result[$key]);
+                }
+            }
+
+            if (!empty($result['errors']) && is_array($result['errors'])) {
+                return sanitize_text_field(reset($result['errors']));
+            }
+
+            return $this->get_zibal_error_message($code);
+        }
+
+        /**
+         * Store payment messages where LearnPress can show order activity.
+         */
+        private function add_order_message($order_id, $message, $state = 'failed')
+        {
+            $message = sanitize_text_field($message);
+            $order = learn_press_get_order($order_id);
+            $order_message = $state === 'completed' ? $message : 'پرداخت زیبال ناموفق: ' . $message;
+
+            if ($order && method_exists($order, 'add_note')) {
+                $order->add_note($order_message);
+            } elseif ($order && method_exists($order, 'add_order_note')) {
+                $order->add_order_note($order_message);
+            }
+
+            update_post_meta($order_id, '_zibal_last_message', $message);
+            update_post_meta($order_id, '_zibal_order_message', $order_message);
+            update_post_meta($order_id, '_zibal_payment_state', sanitize_key($state));
+
+            if ($state !== 'completed' && $state !== 'pending') {
+                update_post_meta($order_id, '_zibal_customer_card_number', 'پرداخت ناموفق - ' . $message);
+                $this->store_order_items_payment_details(
+                    $order,
+                    array(
+                        'status'        => sanitize_key($state),
+                        'failed_message' => $message,
+                        'customer_card'  => 'پرداخت ناموفق - ' . $message,
+                    )
+                );
+            }
+        }
+
+        private function store_order_items_payment_details($order, $details)
+        {
+            if (!$order || !method_exists($order, 'get_items')) {
+                return;
+            }
+
+            $items = $order->get_items();
+
+            if (empty($items)) {
+                return;
+            }
+
+            foreach ($items as $item_key => $item) {
+                $item_id = $this->get_order_item_id($item, $item_key);
+
+                if (!$item_id) {
+                    continue;
+                }
+
+                $this->update_order_item_meta($item_id, '_zibal_payment_state', $details['status']);
+
+                if (!empty($details['customer_card'])) {
+                    $this->update_order_item_meta($item_id, '_zibal_customer_card_number', $details['customer_card']);
+                }
+
+                if (!empty($details['failed_message'])) {
+                    $this->update_order_item_meta($item_id, '_zibal_last_message', $details['failed_message']);
+                }
+            }
+        }
+
+        private function get_order_item_id($item, $fallback)
+        {
+            if (is_object($item)) {
+                foreach (array('get_id', 'get_order_item_id', 'get_item_id') as $method) {
+                    if (method_exists($item, $method)) {
+                        return absint($item->$method());
+                    }
+                }
+
+                if (isset($item->id)) {
+                    return absint($item->id);
+                }
+
+                if (isset($item->item_id)) {
+                    return absint($item->item_id);
+                }
+            }
+
+            if (is_array($item)) {
+                foreach (array('id', 'item_id', 'order_item_id') as $key) {
+                    if (!empty($item[$key])) {
+                        return absint($item[$key]);
                     }
                 }
             }
 
-            return false;
+            return absint($fallback);
+        }
+
+        private function update_order_item_meta($item_id, $key, $value)
+        {
+            if (function_exists('learn_press_update_order_item_meta')) {
+                learn_press_update_order_item_meta($item_id, $key, $value);
+                return;
+            }
+
+            if (function_exists('learn_press_update_order_itemmeta')) {
+                learn_press_update_order_itemmeta($item_id, $key, $value);
+                return;
+            }
+
+            update_post_meta($item_id, $key, $value);
+        }
+
+        /**
+         * Persist the payment binding before redirecting the customer.
+         */
+        private function store_pending_payment($order_id, $amount, $track_id, $callback_token)
+        {
+            update_post_meta($order_id, '_zibal_trackId', sanitize_text_field($track_id));
+            update_post_meta($order_id, '_zibal_amount', absint($amount));
+            update_post_meta($order_id, '_zibal_callback_token', sanitize_text_field($callback_token));
+            update_post_meta($order_id, '_zibal_payment_state', 'pending');
+            update_post_meta($order_id, '_zibal_requested_at', time());
+        }
+
+        /**
+         * Create an unpredictable local binding value for the callback URL.
+         */
+        private function generate_callback_token($order_id)
+        {
+            if (function_exists('wp_generate_password')) {
+                return wp_generate_password(32, false, false);
+            }
+
+            return hash('sha256', $order_id . '|' . microtime(true) . '|' . wp_salt('nonce'));
         }
         
         /**
