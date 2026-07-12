@@ -2,9 +2,9 @@
 /*
 Plugin Name: افزونه پرداخت زیبال برای لرن پرس
 Description: افزونه پرداخت امن زیبال برای لرن پرس
-Author: zibal team
+Author: zibal
 Link: https://zibal.com
-Version: 2.1.1
+Version: 2.2
 Author URI: https://github.com/zibalco
 Tags: learnpress,zibal,gateway,payment,زیبال,lms,لرن پرس
 Text Domain: learnpress-zibal
