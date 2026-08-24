@@ -6,7 +6,7 @@
  * @author   zibal team
  * @link     https://zibal.com
  * @package  LearnPress/Zibal/Classes
- * @version  2.1.1
+ * @version  2.3.0
  */
 
 // Prevent loading this file directly
@@ -38,8 +38,6 @@ if (!class_exists('LP_Gateway_Zibal')) {
         protected $posted = null;
 
         protected $trackId = null;
-
-        private $plugin_user_agent = 'LearnPress-Zibal-Gateway/2.1.1 (WordPress; plugin=gateway-learnpress-zibal.ir; gateway=zibal)';
 
         public function __construct()
         {
@@ -115,6 +113,64 @@ if (!class_exists('LP_Gateway_Zibal')) {
         public function get_supported_currencies()
         {
             return array('IRR', 'IRT');
+        }
+
+        /**
+         * Resolve the currency captured by the LearnPress order.
+         *
+         * @param object $order LearnPress order object.
+         * @return string
+         */
+        private function resolve_zibal_order_currency($order)
+        {
+            $currency = '';
+
+            if ($order && method_exists($order, 'get_currency')) {
+                $currency = $order->get_currency();
+            } elseif ($order && method_exists($order, 'get_order_currency')) {
+                $currency = $order->get_order_currency();
+            }
+
+            if (empty($currency) && $order && method_exists($order, 'get_id')) {
+                $currency = get_post_meta($order->get_id(), '_order_currency', true);
+            }
+
+            if (empty($currency) && function_exists('learn_press_get_currency')) {
+                $currency = learn_press_get_currency();
+            }
+
+            return strtoupper(sanitize_text_field($currency));
+        }
+
+        /**
+         * Convert the LearnPress order amount to the rial amount expected by Zibal.
+         *
+         * @param mixed  $amount   Order amount.
+         * @param string $currency Order currency.
+         * @return int
+         * @throws Exception When the currency or amount cannot be represented safely.
+         */
+        private function convert_zibal_order_amount_to_rials($amount, $currency)
+        {
+            $currency = strtoupper(sanitize_text_field($currency));
+
+            if (!in_array($currency, $this->get_supported_currencies(), true)) {
+                throw new Exception('ارز سفارش برای پرداخت زیبال پشتیبانی نمی‌شود', 8000);
+            }
+
+            if (!is_scalar($amount) || !is_numeric($amount)) {
+                throw new Exception('مبلغ سفارش برای پرداخت زیبال معتبر نیست', 8000);
+            }
+
+            $numeric_amount = (float) $amount;
+            $rial_amount = $currency === 'IRT' ? $numeric_amount * 10 : $numeric_amount;
+            $rounded_amount = round($rial_amount);
+
+            if (!is_finite($rial_amount) || $rial_amount <= 0 || abs($rial_amount - $rounded_amount) > 0.000001 || $rounded_amount >= PHP_INT_MAX) {
+                throw new Exception('مبلغ سفارش برای پرداخت زیبال معتبر نیست', 8000);
+            }
+
+            return (int) $rounded_amount;
         }
 
    
@@ -310,7 +366,9 @@ if (!class_exists('LP_Gateway_Zibal')) {
         {
             $this->order = learn_press_get_order($order);
             $trackId = $this->get_zibal_authority();
-            $gateway_url = $this->startPay . rawurlencode($this->trackId);
+            $gateway_url = ($trackId && $this->trackId !== null)
+                ? $this->startPay . rawurlencode((string) $this->trackId)
+                : '';
 
             return array(
                 'result'   => $trackId ? 'success' : 'fail',
@@ -325,7 +383,15 @@ if (!class_exists('LP_Gateway_Zibal')) {
         {
             if ($this->get_form_data()) {
                 $order_id = absint($this->order->get_id());
-                $amount = absint($this->form_data['amount']);
+                $currency = $this->resolve_zibal_order_currency($this->order);
+
+                try {
+                    $amount = $this->convert_zibal_order_amount_to_rials($this->form_data['amount'], $currency);
+                } catch (Exception $exception) {
+                    $this->add_order_message($order_id, $exception->getMessage(), 'failed');
+                    throw $exception;
+                }
+
                 $callback_token = $this->generate_callback_token($order_id);
 
                 // Use site URL for callback to match domain
@@ -361,10 +427,21 @@ if (!class_exists('LP_Gateway_Zibal')) {
                 }
 
                 if (isset($result['result'])) {
-                    if (intval($result['result']) === 100 && !empty($result['trackId'])) {
-                        $this->trackId = sanitize_text_field($result['trackId']);
-                        $this->store_pending_payment($order_id, $amount, $this->trackId, $callback_token);
-                        return true;
+                    if (intval($result['result']) === 100) {
+                        $provider_track_id = isset($result['trackId']) && is_scalar($result['trackId'])
+                            ? sanitize_text_field((string) $result['trackId'])
+                            : '';
+
+                        if ($provider_track_id !== '') {
+                            // Zibal creates the unique trackId; the plugin only stores its response.
+                            $this->trackId = $provider_track_id;
+                            $this->store_pending_payment($order_id, $amount, $currency, $this->trackId, $callback_token);
+                            return true;
+                        }
+
+                        $message = 'خطا: پاسخ موفق درگاه فاقد شناسه تراکنش معتبر است';
+                        $this->add_order_message($order_id, $message, 'failed');
+                        throw new Exception($message, 8000);
                     }
 
                     // Show Zibal error code
@@ -386,15 +463,16 @@ if (!class_exists('LP_Gateway_Zibal')) {
          */
         protected function send_zibal_request($url, $data)
         {
+            $user_agent = $this->get_plugin_user_agent();
             $response = wp_remote_post(
                 esc_url_raw($url),
                 array(
                     'timeout' => 20,
                     'headers' => array(
                         'Content-Type' => 'application/json',
-                        'User-Agent'   => $this->plugin_user_agent,
+                        'User-Agent'   => $user_agent,
                     ),
-                    'user-agent' => $this->plugin_user_agent,
+                    'user-agent' => $user_agent,
                     'body'    => wp_json_encode($data),
                 )
             );
@@ -424,6 +502,19 @@ if (!class_exists('LP_Gateway_Zibal')) {
             }
 
             return $decoded;
+        }
+
+        /**
+         * Identify this integration in Zibal request logs.
+         *
+         * @return string
+         */
+        private function get_plugin_user_agent()
+        {
+            $version = defined('LP_ZIBAL_VERSION') ? LP_ZIBAL_VERSION : '2.3.0';
+
+            return 'LearnPress-Zibal-Gateway/' . sanitize_text_field($version)
+                . ' (WordPress; plugin=gateway-learnpress-zibal.ir; gateway=zibal)';
         }
 
         /**
@@ -463,7 +554,7 @@ if (!class_exists('LP_Gateway_Zibal')) {
             update_post_meta($order_id, '_zibal_order_message', $order_message);
             update_post_meta($order_id, '_zibal_payment_state', sanitize_key($state));
 
-            if ($state !== 'completed' && $state !== 'pending') {
+            if (!in_array($state, array('completed', 'pending', 'verification_pending', 'manual_review'), true)) {
                 update_post_meta($order_id, '_zibal_customer_card_number', 'پرداخت ناموفق - ' . $message);
                 $this->store_order_items_payment_details(
                     $order,
@@ -554,10 +645,12 @@ if (!class_exists('LP_Gateway_Zibal')) {
         /**
          * Persist the payment binding before redirecting the customer.
          */
-        private function store_pending_payment($order_id, $amount, $track_id, $callback_token)
+        private function store_pending_payment($order_id, $amount, $currency, $track_id, $callback_token)
         {
             update_post_meta($order_id, '_zibal_trackId', sanitize_text_field($track_id));
             update_post_meta($order_id, '_zibal_amount', absint($amount));
+            update_post_meta($order_id, '_zibal_order_currency', strtoupper(sanitize_text_field($currency)));
+            update_post_meta($order_id, '_zibal_amount_unit', 'IRR');
             update_post_meta($order_id, '_zibal_callback_token', sanitize_text_field($callback_token));
             update_post_meta($order_id, '_zibal_payment_state', 'pending');
             update_post_meta($order_id, '_zibal_requested_at', time());

@@ -1,11 +1,16 @@
 <?php
 /*
 Plugin Name: افزونه پرداخت زیبال برای لرن پرس
+Plugin URI: https://zibal.com
 Description: افزونه پرداخت امن زیبال برای لرن پرس
 Author: zibal
-Link: https://zibal.com
-Version: 2.2
+Version: 2.3.0
+Requires at least: 5.7
+Requires PHP: 5.6
+Requires Plugins: learnpress
 Author URI: https://github.com/zibalco
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
 Tags: learnpress,zibal,gateway,payment,زیبال,lms,لرن پرس
 Text Domain: learnpress-zibal
 Domain Path: /languages/
@@ -18,7 +23,7 @@ defined('ABSPATH') || exit;
 define('LP_ZIBAL_FILE', __FILE__);
 define('LP_ZIBAL_PATH', plugin_dir_path(__FILE__));
 define('LP_ZIBAL_URL', plugin_dir_url(__FILE__));
-define('LP_ZIBAL_VERSION', '2.1.1');
+define('LP_ZIBAL_VERSION', '2.3.0');
 
 /**
  * Main plugin class

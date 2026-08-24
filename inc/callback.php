@@ -10,8 +10,6 @@ if (!defined('ABSPATH')) {
 
 class Zibal_Callback_Handler
 {
-    private $plugin_user_agent = 'LearnPress-Zibal-Gateway/2.1.1 (WordPress; plugin=gateway-learnpress-zibal.ir; gateway=zibal)';
-
     public function __construct()
     {
         $this->handle_callback();
@@ -36,20 +34,25 @@ class Zibal_Callback_Handler
                 return;
             }
             
-            $setting = LP()->settings;
-            $merchant = $setting->get('zibal.merchant');
-            
-            if (!$merchant) {
-                $message = 'تنظیمات درگاه پرداخت ناقص است';
-                $this->add_order_message($order, $message, 'failed');
+            if (!$this->validate_callback_binding($order, $request)) {
+                $message = 'اطلاعات بازگشت از درگاه معتبر نیست';
                 $this->set_error_session($message);
                 $this->redirect_to_checkout();
                 return;
             }
 
-            if (!$this->validate_callback_binding($order, $request)) {
-                $message = 'اطلاعات بازگشت از درگاه معتبر نیست';
-                $this->add_order_message($order, $message, 'failed');
+            // Completion is terminal: a replay must never regress a paid order.
+            if ($this->is_order_paid($order)) {
+                $this->redirect_to_return_url($order);
+                return;
+            }
+
+            $setting = LP()->settings;
+            $merchant = $setting->get('zibal.merchant');
+
+            if (!$merchant) {
+                $message = 'تنظیمات درگاه پرداخت ناقص است؛ وضعیت پرداخت نیاز به بررسی مجدد دارد';
+                $this->add_order_message($order, $message, 'verification_pending');
                 $this->set_error_session($message);
                 $this->redirect_to_checkout();
                 return;
@@ -75,7 +78,7 @@ class Zibal_Callback_Handler
                         $request["RefID"] = isset($result['refNumber']) ? $result['refNumber'] : $request['trackId'];
                         $this->payment_status_completed($order, $request, $result, $merchant);
                         $this->redirect_to_return_url($order);
-                    } elseif (isset($result['result']) && intval($result['result']) === 101) {
+                    } elseif (isset($result['result']) && intval($result['result']) === 201) {
                         // Already verified
                         if ($this->is_order_paid($order)) {
                             $this->redirect_to_return_url($order);
@@ -94,9 +97,10 @@ class Zibal_Callback_Handler
                         $this->redirect_to_checkout();
                     }
                 } else {
-                    // API error
+                    // Transport or malformed-response ambiguity is recoverable.
                     $error_msg = isset($result['errors'][0]) ? $result['errors'][0] : 'خطای ارتباط با درگاه';
-                    $this->add_order_message($order, $error_msg, 'failed');
+                    $state = !empty($result['retryable']) ? 'verification_pending' : 'failed';
+                    $this->add_order_message($order, $error_msg, $state);
                     $this->set_error_session($error_msg);
                     $this->redirect_to_checkout();
                 }
@@ -139,7 +143,7 @@ class Zibal_Callback_Handler
             return false;
         }
 
-        if ($payment_state && !in_array($payment_state, array('pending', 'completed'), true)) {
+        if ($payment_state && !in_array($payment_state, array('pending', 'verification_pending', 'manual_review', 'completed'), true)) {
             return false;
         }
 
@@ -157,15 +161,26 @@ class Zibal_Callback_Handler
     public function verify_amount($order, $result)
     {
         $stored_amount = absint(get_post_meta($order->get_id(), '_zibal_amount', true));
+        $stored_currency = $this->normalize_currency(get_post_meta($order->get_id(), '_zibal_order_currency', true));
+        $stored_unit = $this->normalize_currency(get_post_meta($order->get_id(), '_zibal_amount_unit', true));
+        $current_currency = $this->get_order_currency($order);
 
-        if (!$stored_amount) {
+        if (!$stored_amount || ($stored_unit && $stored_unit !== 'IRR')) {
+            return false;
+        }
+
+        if (!$stored_currency) {
+            $stored_currency = $current_currency;
+        }
+
+        if (!$stored_currency || !$current_currency || $stored_currency !== $current_currency) {
             return false;
         }
 
         $verified_amount = 0;
         foreach (array('amount', 'paidAtAmount', 'payableAmount') as $key) {
             if (isset($result[$key])) {
-                $verified_amount = absint($result[$key]);
+                $verified_amount = $this->normalize_rial_amount($result[$key]);
                 break;
             }
         }
@@ -174,26 +189,104 @@ class Zibal_Callback_Handler
             return false;
         }
 
-        return absint($order->get_total()) === $stored_amount;
+        return $this->convert_order_amount_to_rials($order->get_total(), $stored_currency) === $stored_amount;
+    }
+
+    /**
+     * Resolve the order currency independently from the stored payment attempt.
+     */
+    public function get_order_currency($order)
+    {
+        $currency = '';
+
+        if ($order && method_exists($order, 'get_currency')) {
+            $currency = $order->get_currency();
+        } elseif ($order && method_exists($order, 'get_order_currency')) {
+            $currency = $order->get_order_currency();
+        }
+
+        if (empty($currency) && $order && method_exists($order, 'get_id')) {
+            $currency = get_post_meta($order->get_id(), '_order_currency', true);
+        }
+
+        if (empty($currency) && function_exists('learn_press_get_currency')) {
+            $currency = learn_press_get_currency();
+        }
+
+        return $this->normalize_currency($currency);
+    }
+
+    /**
+     * Normalize a currency code without relying on PHP 7+ syntax.
+     */
+    public function normalize_currency($currency)
+    {
+        if (!is_scalar($currency)) {
+            return '';
+        }
+
+        return strtoupper(sanitize_text_field($currency));
+    }
+
+    /**
+     * Convert an order amount to the integer rial amount expected by Zibal.
+     */
+    public function convert_order_amount_to_rials($amount, $currency)
+    {
+        $currency = $this->normalize_currency($currency);
+
+        if (!in_array($currency, array('IRR', 'IRT'), true) || !is_scalar($amount) || !is_numeric($amount)) {
+            return 0;
+        }
+
+        $numeric_amount = (float) $amount;
+        $rial_amount = $currency === 'IRT' ? $numeric_amount * 10 : $numeric_amount;
+        $rounded_amount = round($rial_amount);
+
+        if (!is_finite($rial_amount) || $rial_amount <= 0 || abs($rial_amount - $rounded_amount) > 0.000001 || $rounded_amount >= PHP_INT_MAX) {
+            return 0;
+        }
+
+        return (int) $rounded_amount;
+    }
+
+    /**
+     * Accept only a positive integer rial value from the provider response.
+     */
+    public function normalize_rial_amount($amount)
+    {
+        if (!is_scalar($amount) || !is_numeric($amount)) {
+            return 0;
+        }
+
+        $numeric_amount = (float) $amount;
+        $rounded_amount = round($numeric_amount);
+
+        if (!is_finite($numeric_amount) || $numeric_amount <= 0 || abs($numeric_amount - $rounded_amount) > 0.000001 || $rounded_amount >= PHP_INT_MAX) {
+            return 0;
+        }
+
+        return (int) $rounded_amount;
     }
 
     public function rest_payment_verification($data)
     {
+        $user_agent = $this->get_plugin_user_agent();
         $response = wp_remote_post(
             'https://gateway.zibal.ir/v1/verify',
             array(
                 'timeout' => 20,
                 'headers' => array(
                     'Content-Type' => 'application/json',
-                    'User-Agent'   => $this->plugin_user_agent,
+                    'User-Agent'   => $user_agent,
                 ),
-                'user-agent' => $this->plugin_user_agent,
+                'user-agent' => $user_agent,
                 'body'    => wp_json_encode($data),
             )
         );
 
         if (is_wp_error($response)) {
-            return array('result' => 0, 'errors' => array($response->get_error_message()));
+            return array('result' => 0, 'errors' => array($response->get_error_message()), 'retryable' => true);
         }
 
         $status_code = intval(wp_remote_retrieve_response_code($response));
@@ -203,16 +296,32 @@ class Zibal_Callback_Handler
             $decoded_error = json_decode($body, true);
             $message = is_array($decoded_error) ? $this->get_zibal_response_message($decoded_error, 'خطای ارتباط با درگاه') : 'خطای ارتباط با درگاه';
 
-            return array('result' => 0, 'errors' => array($message));
+            return array('result' => 0, 'errors' => array($message), 'retryable' => true);
         }
 
         $result = json_decode($body, true);
 
-        if (!is_array($result)) {
-            return array('result' => 0, 'errors' => array('پاسخ نامعتبر از درگاه'));
+        if (
+            !is_array($result)
+            || !isset($result['result'])
+            || !is_scalar($result['result'])
+            || !is_numeric($result['result'])
+        ) {
+            return array('result' => 0, 'errors' => array('پاسخ نامعتبر از درگاه'), 'retryable' => true);
         }
         
         return $result;
+    }
+
+    /**
+     * Identify this integration in Zibal verification logs.
+     */
+    public function get_plugin_user_agent()
+    {
+        $version = defined('LP_ZIBAL_VERSION') ? LP_ZIBAL_VERSION : '2.3.0';
+
+        return 'LearnPress-Zibal-Gateway/' . sanitize_text_field($version)
+            . ' (WordPress; plugin=gateway-learnpress-zibal.ir; gateway=zibal)';
     }
 
     public function payment_status_completed($order, $request, $result = array(), $merchant = '')
@@ -311,7 +420,7 @@ class Zibal_Callback_Handler
         update_post_meta($order->get_id(), '_zibal_order_message', $message);
         update_post_meta($order->get_id(), '_zibal_payment_state', sanitize_key($state));
 
-        if ($state !== 'completed' && $state !== 'pending') {
+        if (!in_array($state, array('completed', 'pending', 'verification_pending', 'manual_review'), true)) {
             $this->store_card_number_placeholder($order, 'پرداخت ناموفق - ' . $message);
             $this->store_order_items_payment_details(
                 $order,
