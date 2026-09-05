@@ -23,8 +23,6 @@ if (!class_exists('LP_Gateway_Zibal')) {
 
         private $form_data = array();
 
-        private $startPay = 'https://gateway.zibal.ir/start/';
-
         private $restPaymentRequestUrl = 'https://gateway.zibal.ir/v1/request';
 
         private $restPaymentVerification = 'https://gateway.zibal.ir/v1/verify';
@@ -367,7 +365,10 @@ if (!class_exists('LP_Gateway_Zibal')) {
             $this->order = learn_press_get_order($order);
             $trackId = $this->get_zibal_authority();
             $gateway_url = ($trackId && $this->trackId !== null)
-                ? $this->startPay . rawurlencode((string) $this->trackId)
+                ? add_query_arg(
+                    array('zibal_start' => $this->trackId),
+                    site_url('wp-content/plugins/' . basename(dirname(LP_ZIBAL_FILE)) . '/inc/callback.php')
+                )
                 : '';
 
             return array(

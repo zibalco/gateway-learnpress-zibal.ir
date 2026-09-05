@@ -19,6 +19,17 @@ class Zibal_Callback_Handler
     {
         $request = $this->sanitize_request($_REQUEST);
 
+        if (!empty($request['zibal_start']) && preg_match('/^[A-Za-z0-9_-]{1,128}$/D', $request['zibal_start'])) {
+            nocache_headers();
+            header('Referrer-Policy: origin', true);
+            wp_redirect(
+                'https://gateway.zibal.ir/start/' . rawurlencode($request['zibal_start']),
+                302,
+                'LearnPress Zibal'
+            );
+            exit();
+        }
+
         if (isset($request['learn_press_zibal']) && absint($request['learn_press_zibal']) === 1) {
             $order_id = isset($request['order_id']) ? absint($request['order_id']) : 0;
             
@@ -119,6 +130,7 @@ class Zibal_Callback_Handler
     public function sanitize_request($request)
     {
         return array(
+            'zibal_start'       => isset($request['zibal_start']) ? sanitize_text_field(wp_unslash($request['zibal_start'])) : '',
             'learn_press_zibal' => isset($request['learn_press_zibal']) ? absint(wp_unslash($request['learn_press_zibal'])) : 0,
             'order_id'          => isset($request['order_id']) ? absint(wp_unslash($request['order_id'])) : 0,
             'status'            => isset($request['status']) ? sanitize_text_field(wp_unslash($request['status'])) : '',
